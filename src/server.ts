@@ -1006,4 +1006,18 @@ const PORT = Number(process.env.PORT) || 7860;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   logSecurity("SERVER_START", `Port ${PORT}`);
+
+  // Keep alive: ping self every 10 minutes to prevent Railway free tier spin-down
+  if (isProduction) {
+    const HOST = process.env.RAILWAY_PUBLIC_DOMAIN || `localhost:${PORT}`;
+    const url = `http://${HOST}/health`;
+    setInterval(async () => {
+      try {
+        await fetch(url);
+        console.log("[KEEPALIVE] Self-ping OK");
+      } catch {
+        console.warn("[KEEPALIVE] Self-ping failed");
+      }
+    }, 10 * 60 * 1000);
+  }
 });
