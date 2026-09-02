@@ -377,6 +377,9 @@ app.post("/api/quiz/:quizId/finish", authMiddleware, quizLimiter, async (req: Re
 
     // Batch mode: frontend sends all answers at once
     if (Array.isArray(batchAnswers)) {
+      console.log("[FINISH] Batch mode. Received", batchAnswers.length, "answers");
+      console.log("[FINISH] Sample answers:", JSON.stringify(batchAnswers.slice(0, 3)));
+
       // Delete any existing answers (from prior partial saves)
       await prisma.answer.deleteMany({ where: { attemptId: attempt.id } });
 
@@ -388,6 +391,8 @@ app.post("/api/quiz/:quizId/finish", authMiddleware, quizLimiter, async (req: Re
           questionId: Number(a.questionId),
           selectedOption: Number(a.selectedOption),
         }));
+
+      console.log("[FINISH] Valid answers after filter:", validAnswers.length);
 
       if (validAnswers.length > 0) {
         await prisma.answer.createMany({ data: validAnswers });
@@ -406,6 +411,12 @@ app.post("/api/quiz/:quizId/finish", authMiddleware, quizLimiter, async (req: Re
         where: { attemptId: attempt.id },
         include: { question: true },
       });
+
+      console.log("[FINISH] Saved answers count:", savedAnswers.length);
+      if (savedAnswers.length > 0) {
+        const sample = savedAnswers[0];
+        console.log("[FINISH] Sample saved: selectedOption=", sample.selectedOption, "correctAnswer=", sample.question.correctAnswer, "type selected=", typeof sample.selectedOption, "type correct=", typeof sample.question.correctAnswer);
+      }
 
       let correctCount = 0;
       for (const ans of savedAnswers) {
