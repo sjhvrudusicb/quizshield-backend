@@ -108,7 +108,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as { userId: number };
+    const decoded = jwt.verify(token, JWT_SECRET!) as { userId: number };
     req.body = req.body || {};
     req.body.userId = decoded.userId;
     next();
