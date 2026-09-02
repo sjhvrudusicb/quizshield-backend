@@ -574,8 +574,8 @@ app.post("/api/admin/quizzes", adminLimiter, bodySizeGuard(5), async (req: Reque
     if (!title || typeof title !== "string" || title.trim().length < 2) {
       return res.status(400).json({ error: "Quiz title must be at least 2 characters" });
     }
-    if (!timeLimit || typeof timeLimit !== "number" || timeLimit < 30) {
-      return res.status(400).json({ error: "Time limit must be at least 30 seconds" });
+    if (!timeLimit || typeof timeLimit !== "number" || timeLimit < 30 || timeLimit > 10800) {
+      return res.status(400).json({ error: "Time limit must be between 30 seconds and 3 hours" });
     }
 
     const quiz = await prisma.quiz.create({
