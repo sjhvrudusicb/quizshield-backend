@@ -4,6 +4,7 @@ dotenv.config();
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import helmet from "helmet";
+import compression from "compression";
 import jwt from "jsonwebtoken";
 import prisma from "./prisma";
 import {
@@ -50,6 +51,12 @@ app.use(helmet({
   hsts: isProduction ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
 }));
 
+// 2. Gzip compression — reduces response size by ~70%
+app.use(compression({
+  threshold: 1024,
+  level: 6,
+}));
+
 // 2. Extra custom headers
 app.use(extraSecurityHeaders);
 
@@ -89,6 +96,14 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
     }
   }
   next();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// HEALTH CHECK (fast, no auth, no rate limit)
+// ═══════════════════════════════════════════════════════════════
+
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", timestamp: Date.now() });
 });
 
 // ═══════════════════════════════════════════════════════════════

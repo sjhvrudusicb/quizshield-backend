@@ -12,9 +12,10 @@ const pool = new pg.Pool({
   ssl: {
     rejectUnauthorized: false,
   },
-  max: 10,
-  idleTimeoutMillis: 15000,
-  connectionTimeoutMillis: 10000,
+  max: 5,
+  min: 2,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
 });
