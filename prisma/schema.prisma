@@ -7,24 +7,28 @@ datasource db {
 }
 
 model User {
-  id       Int    @id @default(autoincrement())
-  username String @unique @db.VarChar(50)
-  pin      String @db.VarChar(5)
-  attempts Attempt[]
+  id             Int             @id @default(autoincrement())
+  username       String          @unique
+  email          String?         @unique
+  pinHash        String
+  createdAt      DateTime        @default(now())
+  attempts       Attempt[]
+  retakeRequests RetakeRequest[]
 }
 
 model Quiz {
-  id        Int      @id @default(autoincrement())
-  title     String
-  timeLimit Int
-  questions Question[]
-  attempts  Attempt[]
+  id             Int             @id @default(autoincrement())
+  title          String
+  timeLimit      Int
+  questions      Question[]
+  attempts       Attempt[]
+  retakeRequests RetakeRequest[]
 }
 
 model Question {
   id             Int      @id @default(autoincrement())
   quizId         Int
-  quiz           Quiz     @relation(fields: [quizId], references: [id])
+  quiz           Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
   text           String
   options        Json
   correctAnswer  Int
@@ -34,9 +38,9 @@ model Question {
 model Attempt {
   id          Int      @id @default(autoincrement())
   userId      Int
-  user        User     @relation(fields: [userId], references: [id])
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   quizId      Int
-  quiz        Quiz     @relation(fields: [quizId], references: [id])
+  quiz        Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
   score       Float
   status      String
   tabSwitches Int      @default(0)
@@ -45,10 +49,26 @@ model Attempt {
 }
 
 model Answer {
-  id         Int     @id @default(autoincrement())
-  attemptId  Int
-  attempt    Attempt @relation(fields: [attemptId], references: [id])
-  questionId Int
-  question   Question @relation(fields: [questionId], references: [id])
+  id             Int      @id @default(autoincrement())
+  attemptId      Int
+  attempt        Attempt  @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId     Int
+  question       Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
   selectedOption Int
+}
+
+model RetakeRequest {
+  id         Int       @id @default(autoincrement())
+  userId     Int
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quizId     Int
+  quiz       Quiz      @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  category   String    @default("technical")
+  reason     String    @db.VarChar(1000)
+  status     String    @default("pending")
+  adminNote  String?   @db.Text
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@unique([userId, quizId, status])
 }

@@ -6,14 +6,19 @@ import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcrypt";
+import crypto from "crypto";
 import prisma from "./prisma";
 import {
   apiLimiter,
   loginLimiter,
+  registerLimiter,
   quizLimiter,
   adminLimiter,
   validateUsername,
   validatePin,
+  validateEmail,
+  validateRetakeReason,
   validateAdminPin,
   validateQuizId,
   validateSelectedOption,
@@ -26,6 +31,11 @@ import {
   logSecurity,
   getSecurityLog,
 } from "./security";
+import {
+  sendWelcomeEmail,
+  sendAdminRetakeNotification,
+  sendStudentRetakeApproval,
+} from "./email";
 
 const app = express();
 
@@ -70,7 +80,7 @@ app.use(cors({
   ],
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-key"],
   maxAge: 86400,
 }));
 
@@ -133,6 +143,73 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// AUTH: REGISTRATION (Self-service with @gmail.com & auto-generated 5-digit PIN)
+// ═══════════════════════════════════════════════════════════════
+
+app.post("/api/auth/register", registerLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
+  try {
+    const { username, email } = req.body || {};
+
+    const usernameErr = validateUsername(username);
+    if (usernameErr) return res.status(400).json({ error: usernameErr });
+
+    const emailErr = validateEmail(email);
+    if (emailErr) return res.status(400).json({ error: emailErr });
+
+    const cleanUsername = sanitize(username).toLowerCase();
+    const cleanEmail = sanitize(email).toLowerCase();
+
+    // Verify unique username or email
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: cleanUsername },
+          { email: cleanEmail },
+        ],
+      },
+    });
+
+    if (existingUser) {
+      if (existingUser.username === cleanUsername) {
+        return res.status(409).json({ error: "This username is already taken. Please choose another." });
+      }
+      if (existingUser.email === cleanEmail) {
+        return res.status(409).json({ error: "An account with this Gmail address already exists." });
+      }
+    }
+
+    // Generate cryptographically random 5-digit PIN (10000 to 99999)
+    const pin = crypto.randomInt(10000, 100000).toString();
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    const newUser = await prisma.user.create({
+      data: {
+        username: cleanUsername,
+        email: cleanEmail,
+        pinHash,
+      },
+    });
+
+    logSecurity("USER_REGISTERED", cleanUsername, `Email: ${cleanEmail}`, req);
+
+    // Send welcome email with generated PIN asynchronously
+    sendWelcomeEmail(cleanEmail, cleanUsername, pin).catch((err) => {
+      console.error("[Register] Error sending welcome email:", err);
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Registration successful! Your 5-digit PIN has been emailed to ${cleanEmail}. Check your inbox to log in.`,
+      username: newUser.username,
+      email: newUser.email,
+    });
+  } catch (error) {
+    console.error("Registration error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // AUTH: LOGIN (with account lockout)
 // ═══════════════════════════════════════════════════════════════
 
@@ -159,8 +236,9 @@ app.post("/api/auth/login", loginLimiter, async (req: Request, res: Response) =>
       where: { username: cleanUsername },
     });
 
-    // Constant-time comparison (prevents timing attacks)
-    if (!user || !timingSafeEqual(user.pin, pin)) {
+    // Constant-time hash verification via bcrypt (prevents timing attacks)
+    const isValid = user ? await bcrypt.compare(pin, user.pinHash) : false;
+    if (!user || !isValid) {
       recordFailedLogin(cleanUsername);
       logSecurity("LOGIN_FAILED", cleanUsername, "", req);
       // Generic error — doesn't reveal whether username exists (prevents user enumeration)
@@ -172,7 +250,7 @@ app.post("/api/auth/login", loginLimiter, async (req: Request, res: Response) =>
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "24h" });
 
     logSecurity("LOGIN_SUCCESS", cleanUsername, "", req);
-    res.json({ token, userId: user.id, username: user.username });
+    res.json({ token, userId: user.id, username: user.username, email: user.email });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -189,16 +267,47 @@ app.get("/api/quizzes", authMiddleware, async (req: Request, res: Response) => {
     const quizzes = await prisma.quiz.findMany({
       include: {
         questions: { select: { id: true } },
-        attempts: { where: { userId }, select: { id: true } },
+        attempts: {
+          where: { userId },
+          select: { id: true, score: true, status: true, tabSwitches: true, createdAt: true },
+          orderBy: { createdAt: "desc" },
+          take: 1,
+        },
+        retakeRequests: {
+          where: { userId },
+          select: { id: true, status: true, category: true, reason: true, createdAt: true, resolvedAt: true },
+          orderBy: { createdAt: "desc" },
+          take: 1,
+        },
       },
+      orderBy: { id: "asc" },
     });
-    res.json(quizzes.map((q) => ({
-      id: q.id,
-      title: q.title,
-      timeLimit: q.timeLimit,
-      questionCount: q.questions.length,
-      canStart: q.attempts.length === 0,
-    })));
+
+    res.json(quizzes.map((q) => {
+      const latestAttempt = q.attempts[0] || null;
+      const latestRetake = q.retakeRequests[0] || null;
+      return {
+        id: q.id,
+        title: q.title,
+        timeLimit: q.timeLimit,
+        questionCount: q.questions.length,
+        canStart: q.attempts.length === 0,
+        attempt: latestAttempt ? {
+          id: latestAttempt.id,
+          score: latestAttempt.score,
+          status: latestAttempt.status,
+          tabSwitches: latestAttempt.tabSwitches,
+          createdAt: latestAttempt.createdAt,
+        } : null,
+        retakeRequest: latestRetake ? {
+          id: latestRetake.id,
+          status: latestRetake.status,
+          category: latestRetake.category,
+          reason: latestRetake.reason,
+          createdAt: latestRetake.createdAt,
+        } : null,
+      };
+    }));
   } catch (error) {
     console.error("Get quizzes error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -457,19 +566,136 @@ app.post("/api/quiz/:quizId/finish", authMiddleware, quizLimiter, async (req: Re
 });
 
 // ═══════════════════════════════════════════════════════════════
+// RETAKE / 2ND CHANCE REQUEST (Student Route)
+// ═══════════════════════════════════════════════════════════════
+
+app.post("/api/quiz/:quizId/request-retake", authMiddleware, quizLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
+  try {
+    const { quizId } = req.params;
+    const { category, reason } = req.body || {};
+    const userId = req.body.userId!;
+
+    const quizIdErr = validateQuizId(quizId);
+    if (quizIdErr) return res.status(400).json({ error: quizIdErr });
+
+    const reasonErr = validateRetakeReason(reason);
+    if (reasonErr) return res.status(400).json({ error: reasonErr });
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const quiz = await prisma.quiz.findUnique({ where: { id: Number(quizId) } });
+    if (!quiz) return res.status(404).json({ error: "Quiz not found" });
+
+    // Ensure student actually attempted this quiz
+    const attempt = await prisma.attempt.findFirst({
+      where: { userId, quizId: Number(quizId) },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (!attempt) {
+      return res.status(400).json({ error: "You cannot request a 2nd chance for a quiz topic you have not attempted." });
+    }
+
+    // Check if there is already a pending request
+    const existingPending = await prisma.retakeRequest.findFirst({
+      where: { userId, quizId: Number(quizId), status: "pending" },
+    });
+
+    if (existingPending) {
+      return res.status(409).json({ error: "You already have a pending 2nd chance request for this topic." });
+    }
+
+    const cleanReason = reason && typeof reason === "string" ? sanitize(reason).trim() : "Technical or connectivity difficulties during the exam.";
+    const validCategory = ["technical", "connectivity", "interrupted", "other"].includes(category)
+      ? category
+      : "technical";
+
+    const retakeRequest = await prisma.retakeRequest.create({
+      data: {
+        userId,
+        quizId: Number(quizId),
+        category: validCategory,
+        reason: cleanReason,
+        status: "pending",
+      },
+    });
+
+    logSecurity("RETAKE_REQUESTED", `${user.username} quiz=${quiz.id} category=${validCategory}`, "", req);
+
+    // Asynchronously dispatch notification to admin email
+    sendAdminRetakeNotification({
+      studentUsername: user.username,
+      studentEmail: user.email,
+      quizTitle: quiz.title,
+      quizId: quiz.id,
+      previousScore: attempt.score,
+      tabSwitches: attempt.tabSwitches,
+      reason: cleanReason,
+      category: validCategory,
+    }).catch((err) => {
+      console.error("[Retake] Failed to dispatch admin notification email:", err);
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Your request for a 2nd chance has been submitted. The instructor will review it shortly.",
+      request: retakeRequest,
+    });
+  } catch (error) {
+    console.error("Retake request submission error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// ADMIN AUTHENTICATION MIDDLEWARE
+// ═══════════════════════════════════════════════════════════════
+
+function verifyAdminKey(providedKey: string | undefined): boolean {
+  if (!providedKey || !ADMIN_PIN) return false;
+
+  const keyBuffer = Buffer.from(providedKey);
+  const adminPinBuffer = Buffer.from(ADMIN_PIN);
+
+  if (keyBuffer.length !== adminPinBuffer.length) {
+    // Timing-attack prevention: run constant-time comparison on equal length buffers
+    crypto.timingSafeEqual(adminPinBuffer, adminPinBuffer);
+    return false;
+  }
+
+  return crypto.timingSafeEqual(keyBuffer, adminPinBuffer);
+}
+
+function adminMiddleware(req: Request, res: Response, next: NextFunction) {
+  let key: string | undefined = undefined;
+
+  const adminHeader = req.headers["x-admin-key"];
+  if (typeof adminHeader === "string") {
+    key = adminHeader.trim();
+  } else if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
+    key = req.headers.authorization.substring(7).trim();
+  }
+
+  if (!verifyAdminKey(key)) {
+    logSecurity("ADMIN_AUTH_FAILED", "", `${req.method} ${req.originalUrl || req.url}`, req);
+    return res.status(403).json({ error: "Invalid admin PIN" });
+  }
+
+  next();
+}
+
+// Protect all /api/admin routes with header-based admin authentication
+app.use("/api/admin", adminMiddleware);
+
+// ═══════════════════════════════════════════════════════════════
 // ADMIN ROUTES
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/api/admin/reset-attempt", adminLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
   try {
-    const { username, quizId, adminPin } = req.body;
-
-    const pinErr = validateAdminPin(adminPin);
-    if (pinErr) return res.status(400).json({ error: pinErr });
-    if (adminPin !== ADMIN_PIN) {
-      logSecurity("ADMIN_AUTH_FAILED", "", "", req);
-      return res.status(403).json({ error: "Invalid admin PIN" });
-    }
+    const { username, quizId } = req.body;
 
     const usernameErr = validateUsername(username);
     if (usernameErr) return res.status(400).json({ error: usernameErr });
@@ -499,12 +725,6 @@ app.post("/api/admin/reset-attempt", adminLimiter, bodySizeGuard(5), async (req:
 
 app.get("/api/admin/attempts", adminLimiter, async (req: Request, res: Response) => {
   try {
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) {
-      logSecurity("ADMIN_AUTH_FAILED", "", "", req);
-      return res.status(403).json({ error: "Invalid admin PIN" });
-    }
-
     const attempts = await prisma.attempt.findMany({
       include: {
         user: { select: { id: true, username: true } },
@@ -529,12 +749,162 @@ app.get("/api/admin/attempts", adminLimiter, async (req: Request, res: Response)
   }
 });
 
-// Security log viewer (admin only)
-app.get("/api/admin/security-log", adminLimiter, (req: Request, res: Response) => {
-  const { adminPin } = req.query;
-  if (adminPin !== ADMIN_PIN) {
-    return res.status(403).json({ error: "Invalid admin PIN" });
+// ═══════════════════════════════════════════════════════════════
+// ADMIN: RETAKE REQUESTS INBOX & 1-CLICK ACTIONS
+// ═══════════════════════════════════════════════════════════════
+
+// List all 2nd chance requests
+app.get("/api/admin/retake-requests", adminLimiter, async (_req: Request, res: Response) => {
+  try {
+    const requests = await prisma.retakeRequest.findMany({
+      include: {
+        user: { select: { id: true, username: true, email: true } },
+        quiz: { select: { id: true, title: true } },
+      },
+      orderBy: [
+        { createdAt: "desc" },
+      ],
+    });
+
+    // Enrich each request with attempt history
+    const enriched = await Promise.all(
+      requests.map(async (item) => {
+        const attempt = await prisma.attempt.findFirst({
+          where: { userId: item.userId, quizId: item.quizId },
+          orderBy: { createdAt: "desc" },
+          select: { id: true, score: true, status: true, tabSwitches: true, createdAt: true },
+        });
+
+        return {
+          id: item.id,
+          userId: item.userId,
+          username: item.user.username,
+          userEmail: item.user.email,
+          quizId: item.quizId,
+          quizTitle: item.quiz.title,
+          category: item.category,
+          reason: item.reason,
+          status: item.status,
+          adminNote: item.adminNote,
+          createdAt: item.createdAt,
+          resolvedAt: item.resolvedAt,
+          attempt: attempt ? {
+            score: attempt.score,
+            status: attempt.status,
+            tabSwitches: attempt.tabSwitches,
+            createdAt: attempt.createdAt,
+          } : null,
+        };
+      })
+    );
+
+    res.json(enriched);
+  } catch (error) {
+    console.error("Admin list retake requests error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
+});
+
+// 1-Click Approve Retake: sets status="approved", clears student attempt for that quiz, emails student
+app.post("/api/admin/retake-requests/:requestId/approve", adminLimiter, async (req: Request, res: Response) => {
+  try {
+    const { requestId } = req.params;
+    const numId = Number(requestId);
+    if (!Number.isInteger(numId) || numId <= 0) return res.status(400).json({ error: "Invalid request ID" });
+
+    const retake = await prisma.retakeRequest.findUnique({
+      where: { id: numId },
+      include: {
+        user: { select: { id: true, username: true, email: true } },
+        quiz: { select: { id: true, title: true } },
+      },
+    });
+
+    if (!retake) return res.status(404).json({ error: "Retake request not found" });
+
+    // Update request status
+    const updated = await prisma.retakeRequest.update({
+      where: { id: numId },
+      data: {
+        status: "approved",
+        resolvedAt: new Date(),
+      },
+    });
+
+    // Clear previous attempt and answers for this student on this specific quiz
+    const attempts = await prisma.attempt.findMany({
+      where: { userId: retake.userId, quizId: retake.quizId },
+      select: { id: true },
+    });
+
+    const attemptIds = attempts.map((a) => a.id);
+    if (attemptIds.length > 0) {
+      await prisma.answer.deleteMany({ where: { attemptId: { in: attemptIds } } });
+      await prisma.attempt.deleteMany({ where: { id: { in: attemptIds } } });
+    }
+
+    logSecurity("ADMIN_RETAKE_APPROVED", `Request ${numId} for ${retake.user.username} on quiz ${retake.quizId}`, "", req);
+
+    // Send confirmation email to student if email is registered
+    if (retake.user.email) {
+      sendStudentRetakeApproval(retake.user.email, retake.user.username, retake.quiz.title).catch((err) => {
+        console.error("[Retake] Error sending student approval email:", err);
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Retake request approved for ${retake.user.username} on "${retake.quiz.title}". Attempt lock cleared!`,
+      request: updated,
+    });
+  } catch (error) {
+    console.error("Approve retake error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Decline Retake: sets status="declined"
+app.post("/api/admin/retake-requests/:requestId/decline", adminLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
+  try {
+    const { requestId } = req.params;
+    const { note } = req.body || {};
+    const numId = Number(requestId);
+    if (!Number.isInteger(numId) || numId <= 0) return res.status(400).json({ error: "Invalid request ID" });
+
+    const retake = await prisma.retakeRequest.findUnique({
+      where: { id: numId },
+      include: {
+        user: { select: { username: true } },
+        quiz: { select: { title: true } },
+      },
+    });
+
+    if (!retake) return res.status(404).json({ error: "Retake request not found" });
+
+    const updated = await prisma.retakeRequest.update({
+      where: { id: numId },
+      data: {
+        status: "declined",
+        adminNote: note ? sanitize(note).trim() : null,
+        resolvedAt: new Date(),
+      },
+    });
+
+    logSecurity("ADMIN_RETAKE_DECLINED", `Request ${numId} for ${retake.user.username}`, "", req);
+
+    res.json({
+      success: true,
+      message: `Retake request declined for ${retake.user.username}.`,
+      request: updated,
+    });
+  } catch (error) {
+    console.error("Decline retake error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Security log viewer (admin only)
+app.get("/api/admin/security-log", adminLimiter, (_req: Request, res: Response) => {
   res.json(getSecurityLog().slice(0, 100));
 });
 
@@ -543,11 +913,8 @@ app.get("/api/admin/security-log", adminLimiter, (req: Request, res: Response) =
 // ═══════════════════════════════════════════════════════════════
 
 // List all quizzes with question counts
-app.get("/api/admin/quizzes", adminLimiter, async (req: Request, res: Response) => {
+app.get("/api/admin/quizzes", adminLimiter, async (_req: Request, res: Response) => {
   try {
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
-
     const quizzes = await prisma.quiz.findMany({
       include: { questions: { select: { id: true } } },
       orderBy: { id: "asc" },
@@ -568,8 +935,7 @@ app.get("/api/admin/quizzes", adminLimiter, async (req: Request, res: Response) 
 // Create a new quiz
 app.post("/api/admin/quizzes", adminLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
   try {
-    const { adminPin, title, timeLimit } = req.body;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
+    const { title, timeLimit } = req.body;
 
     if (!title || typeof title !== "string" || title.trim().length < 2) {
       return res.status(400).json({ error: "Quiz title must be at least 2 characters" });
@@ -590,12 +956,57 @@ app.post("/api/admin/quizzes", adminLimiter, bodySizeGuard(5), async (req: Reque
   }
 });
 
+// Update an existing quiz
+const updateQuizHandler = async (req: Request, res: Response) => {
+  try {
+    const { quizId } = req.params;
+    const { title, timeLimit } = req.body || {};
+
+    const quizIdErr = validateQuizId(quizId);
+    if (quizIdErr) return res.status(400).json({ error: quizIdErr });
+
+    const existingQuiz = await prisma.quiz.findUnique({ where: { id: Number(quizId) } });
+    if (!existingQuiz) return res.status(404).json({ error: "Quiz not found" });
+
+    const data: { title?: string; timeLimit?: number } = {};
+
+    if (title !== undefined) {
+      if (typeof title !== "string" || title.trim().length < 2) {
+        return res.status(400).json({ error: "Quiz title must be at least 2 characters" });
+      }
+      data.title = sanitize(title).trim();
+    }
+
+    if (timeLimit !== undefined) {
+      if (typeof timeLimit !== "number" || timeLimit < 30 || timeLimit > 10800) {
+        return res.status(400).json({ error: "Time limit must be between 30 seconds and 3 hours" });
+      }
+      data.timeLimit = timeLimit;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "Nothing to update" });
+    }
+
+    const updatedQuiz = await prisma.quiz.update({
+      where: { id: Number(quizId) },
+      data,
+    });
+
+    logSecurity("ADMIN_QUIZ_UPDATED", `Quiz ${quizId}: ${updatedQuiz.title}`, "", req);
+    res.json({ id: updatedQuiz.id, title: updatedQuiz.title, timeLimit: updatedQuiz.timeLimit });
+  } catch (error) {
+    console.error("Admin update quiz error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+app.patch("/api/admin/quizzes/:quizId", adminLimiter, bodySizeGuard(5), updateQuizHandler);
+app.put("/api/admin/quizzes/:quizId", adminLimiter, bodySizeGuard(5), updateQuizHandler);
+
 // Delete a quiz and all its questions/answers
 app.delete("/api/admin/quizzes/:quizId", adminLimiter, async (req: Request, res: Response) => {
   try {
     const { quizId } = req.params;
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
 
     const quizIdErr = validateQuizId(quizId);
     if (quizIdErr) return res.status(400).json({ error: quizIdErr });
@@ -622,8 +1033,6 @@ app.delete("/api/admin/quizzes/:quizId", adminLimiter, async (req: Request, res:
 app.get("/api/admin/quizzes/:quizId/questions", adminLimiter, async (req: Request, res: Response) => {
   try {
     const { quizId } = req.params;
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
 
     const quizIdErr = validateQuizId(quizId);
     if (quizIdErr) return res.status(400).json({ error: quizIdErr });
@@ -649,8 +1058,7 @@ app.get("/api/admin/quizzes/:quizId/questions", adminLimiter, async (req: Reques
 app.post("/api/admin/quizzes/:quizId/questions", adminLimiter, bodySizeGuard(10), async (req: Request, res: Response) => {
   try {
     const { quizId } = req.params;
-    const { adminPin, text, options, correctAnswer } = req.body;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
+    const { text, options, correctAnswer } = req.body;
 
     const quizIdErr = validateQuizId(quizId);
     if (quizIdErr) return res.status(400).json({ error: quizIdErr });
@@ -689,8 +1097,7 @@ app.post("/api/admin/quizzes/:quizId/questions", adminLimiter, bodySizeGuard(10)
 app.post("/api/admin/quizzes/:quizId/questions/bulk", adminLimiter, bodySizeGuard(100), async (req: Request, res: Response) => {
   try {
     const { quizId } = req.params;
-    const { adminPin, questions } = req.body;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
+    const { questions } = req.body;
 
     const quizIdErr = validateQuizId(quizId);
     if (quizIdErr) return res.status(400).json({ error: quizIdErr });
@@ -750,8 +1157,7 @@ app.post("/api/admin/quizzes/:quizId/questions/bulk", adminLimiter, bodySizeGuar
 app.put("/api/admin/questions/:questionId", adminLimiter, bodySizeGuard(10), async (req: Request, res: Response) => {
   try {
     const { questionId } = req.params;
-    const { adminPin, text, options, correctAnswer } = req.body || {};
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
+    const { text, options, correctAnswer } = req.body || {};
 
     const question = await prisma.question.findUnique({ where: { id: Number(questionId) } });
     if (!question) return res.status(404).json({ error: "Question not found" });
@@ -802,8 +1208,6 @@ app.put("/api/admin/questions/:questionId", adminLimiter, bodySizeGuard(10), asy
 app.delete("/api/admin/questions/:questionId", adminLimiter, async (req: Request, res: Response) => {
   try {
     const { questionId } = req.params;
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
 
     const question = await prisma.question.findUnique({ where: { id: Number(questionId) } });
     if (!question) return res.status(404).json({ error: "Question not found" });
@@ -824,15 +1228,14 @@ app.delete("/api/admin/questions/:questionId", adminLimiter, async (req: Request
 // ═══════════════════════════════════════════════════════════════
 
 // List all users with attempt counts
-app.get("/api/admin/users", adminLimiter, async (req: Request, res: Response) => {
+app.get("/api/admin/users", adminLimiter, async (_req: Request, res: Response) => {
   try {
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
-
     const users = await prisma.user.findMany({
       select: {
         id: true,
         username: true,
+        email: true,
+        createdAt: true,
         attempts: {
           select: {
             id: true,
@@ -851,6 +1254,8 @@ app.get("/api/admin/users", adminLimiter, async (req: Request, res: Response) =>
     res.json(users.map((u) => ({
       id: u.id,
       username: u.username,
+      email: u.email,
+      createdAt: u.createdAt,
       attemptCount: u.attempts.length,
       attempts: u.attempts.map((a) => ({
         attemptId: a.id,
@@ -871,42 +1276,117 @@ app.get("/api/admin/users", adminLimiter, async (req: Request, res: Response) =>
 // Create a new user
 app.post("/api/admin/users", adminLimiter, bodySizeGuard(5), async (req: Request, res: Response) => {
   try {
-    const { adminPin, username, pin } = req.body || {};
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
+    const { username, email, pin } = req.body || {};
 
     const usernameErr = validateUsername(username);
     if (usernameErr) return res.status(400).json({ error: usernameErr });
 
+    const cleanUsername = sanitize(username).toLowerCase();
+    const effectiveEmail = email ? sanitize(email).toLowerCase() : `${cleanUsername}@gmail.com`;
+
+    const emailErr = validateEmail(effectiveEmail);
+    if (emailErr) return res.status(400).json({ error: emailErr });
+
     const pinErr = validatePin(pin);
     if (pinErr) return res.status(400).json({ error: pinErr });
 
-    const cleanUsername = sanitize(username).toLowerCase();
-
-    // Check if user already exists
-    const existing = await prisma.user.findUnique({ where: { username: cleanUsername } });
+    // Check if user or email already exists
+    const existing = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: cleanUsername },
+          { email: effectiveEmail },
+        ],
+      },
+    });
     if (existing) {
-      return res.status(409).json({ error: "Username already exists" });
+      return res.status(409).json({ error: "Username or email already exists" });
     }
 
+    const pinHash = await bcrypt.hash(pin.trim(), 10);
+
     const user = await prisma.user.create({
-      data: { username: cleanUsername, pin: pin.trim() },
-      select: { id: true, username: true },
+      data: { username: cleanUsername, email: effectiveEmail, pinHash },
+      select: { id: true, username: true, email: true },
     });
 
     logSecurity("ADMIN_USER_CREATED", `User ${user.id}: ${user.username}`, "", req);
-    res.json({ id: user.id, username: user.username });
+    res.json({ id: user.id, username: user.username, email: user.email });
   } catch (error) {
     console.error("Admin create user error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// Update an existing user
+const updateUserHandler = async (req: Request, res: Response) => {
+  try {
+    const { userId } = req.params;
+    const { username, email, pin } = req.body || {};
+
+    const numUserId = Number(userId);
+    if (!Number.isInteger(numUserId) || numUserId <= 0) return res.status(400).json({ error: "Invalid user ID" });
+
+    const existingUser = await prisma.user.findUnique({ where: { id: numUserId } });
+    if (!existingUser) return res.status(404).json({ error: "User not found" });
+
+    const data: { username?: string; email?: string; pinHash?: string } = {};
+
+    if (username !== undefined) {
+      const usernameErr = validateUsername(username);
+      if (usernameErr) return res.status(400).json({ error: usernameErr });
+      const cleanUsername = sanitize(username).toLowerCase();
+
+      // Check if username is already taken by another user
+      if (cleanUsername !== existingUser.username) {
+        const duplicate = await prisma.user.findUnique({ where: { username: cleanUsername } });
+        if (duplicate) return res.status(409).json({ error: "Username already exists" });
+      }
+      data.username = cleanUsername;
+    }
+
+    if (email !== undefined) {
+      const emailErr = validateEmail(email);
+      if (emailErr) return res.status(400).json({ error: emailErr });
+      const cleanEmail = sanitize(email).toLowerCase();
+
+      if (cleanEmail !== existingUser.email) {
+        const duplicate = await prisma.user.findUnique({ where: { email: cleanEmail } });
+        if (duplicate) return res.status(409).json({ error: "Email already registered to another user" });
+      }
+      data.email = cleanEmail;
+    }
+
+    if (pin !== undefined && pin !== "") {
+      const pinErr = validatePin(pin);
+      if (pinErr) return res.status(400).json({ error: pinErr });
+      data.pinHash = await bcrypt.hash(String(pin).trim(), 10);
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: "Nothing to update" });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: numUserId },
+      data,
+      select: { id: true, username: true, email: true },
+    });
+
+    logSecurity("ADMIN_USER_UPDATED", `User ${updatedUser.id}: ${updatedUser.username}`, "", req);
+    res.json({ id: updatedUser.id, username: updatedUser.username, email: updatedUser.email });
+  } catch (error) {
+    console.error("Admin update user error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+app.patch("/api/admin/users/:userId", adminLimiter, bodySizeGuard(5), updateUserHandler);
+app.put("/api/admin/users/:userId", adminLimiter, bodySizeGuard(5), updateUserHandler);
+
 // Delete a user and all their attempts
 app.delete("/api/admin/users/:userId", adminLimiter, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
 
     const user = await prisma.user.findUnique({ where: { id: Number(userId) } });
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -930,8 +1410,6 @@ app.delete("/api/admin/users/:userId", adminLimiter, async (req: Request, res: R
 app.get("/api/admin/users/:userId/results", adminLimiter, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const { adminPin } = req.query;
-    if (adminPin !== ADMIN_PIN) return res.status(403).json({ error: "Invalid admin PIN" });
 
     const user = await prisma.user.findUnique({
       where: { id: Number(userId) },
@@ -1004,12 +1482,13 @@ app.get("/api/users/me", authMiddleware, async (req: Request, res: Response) => 
         quizId: a.quiz.id,
         quizTitle: a.quiz.title,
         score: a.score,
-        percentage: a.score,
+        percentage: Number(a.score.toFixed(2)),
         status: a.status === "passed" || a.score >= 75 ? "Passed" : "Not Passed",
         completedAt: a.createdAt,
         answers: a.answers.map((ans) => ({
           questionId: ans.questionId,
           questionText: ans.question.text,
+          options: ans.question.options,
           selectedOption: ans.selectedOption,
           correctAnswer: ans.question.correctAnswer,
           isCorrect: ans.selectedOption === ans.question.correctAnswer,

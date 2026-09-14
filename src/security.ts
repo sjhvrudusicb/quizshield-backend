@@ -24,6 +24,15 @@ export const loginLimiter = rateLimit({
   skipSuccessfulRequests: true,
 });
 
+// Registration: 10 per 15 minutes per IP
+export const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many registration requests. Please wait 15 minutes." },
+});
+
 // Quiz operations: 30 per minute
 export const quizLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -133,6 +142,27 @@ export function validateUsername(username: any): string | null {
 export function validatePin(pin: any): string | null {
   if (!pin || typeof pin !== "string") return "PIN is required";
   if (!/^\d{5}$/.test(pin.trim())) return "PIN must be exactly 5 digits";
+  return null;
+}
+
+export function validateEmail(email: any): string | null {
+  if (!email || typeof email !== "string") return "Email is required";
+  const trimmed = email.trim().toLowerCase();
+  if (trimmed.length > 254) return "Email is too long";
+  // Enforce strictly @gmail.com
+  const gmailRegex = /^[a-zA-Z0-9._%+-]+@gmail\.com$/;
+  if (!gmailRegex.test(trimmed)) {
+    return "Registration is currently restricted to valid @gmail.com addresses";
+  }
+  return null;
+}
+
+export function validateRetakeReason(reason: any): string | null {
+  if (reason === undefined || reason === null || reason === "") return null; // Optional
+  if (typeof reason !== "string") return "Explanation must be text";
+  if (reason.length > 1000) return "Explanation exceeds maximum length of 1,000 characters";
+  const words = reason.trim().split(/\s+/).filter(Boolean);
+  if (words.length > 200) return "Explanation exceeds maximum word limit of 200 words";
   return null;
 }
 
