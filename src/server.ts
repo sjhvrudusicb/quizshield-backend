@@ -1,3 +1,10 @@
+import dns from "dns";
+
+// Force Node.js to resolve IPv4 addresses first (prevents unroutable IPv6 ENETUNREACH in Railway/Docker)
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -35,9 +42,14 @@ import {
   sendWelcomeEmail,
   sendAdminRetakeNotification,
   sendStudentRetakeApproval,
+  getEmailServiceStatus,
 } from "./email";
 
 const app = express();
+
+// Trust reverse proxy (Railway, Render, HuggingFace, Vercel, Nginx, Cloudflare)
+// Crucial for express-rate-limit to read X-Forwarded-For correctly without throwing validation errors
+app.set("trust proxy", 1);
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_PIN = process.env.ADMIN_PIN;
@@ -182,6 +194,14 @@ app.post("/api/auth/register", registerLimiter, bodySizeGuard(5), async (req: Re
     const pin = crypto.randomInt(10000, 100000).toString();
     const pinHash = await bcrypt.hash(pin, 10);
 
+    // Deliver PIN to candidate's email address BEFORE registration is confirmed
+    const emailSent = await sendWelcomeEmail(cleanEmail, cleanUsername, pin);
+    if (!emailSent) {
+      return res.status(502).json({
+        error: `Failed to deliver verification PIN to ${cleanEmail}. Please verify your Gmail address is correct and active, then try again.`,
+      });
+    }
+
     const newUser = await prisma.user.create({
       data: {
         username: cleanUsername,
@@ -192,14 +212,9 @@ app.post("/api/auth/register", registerLimiter, bodySizeGuard(5), async (req: Re
 
     logSecurity("USER_REGISTERED", cleanUsername, `Email: ${cleanEmail}`, req);
 
-    // Send welcome email with generated PIN asynchronously
-    sendWelcomeEmail(cleanEmail, cleanUsername, pin).catch((err) => {
-      console.error("[Register] Error sending welcome email:", err);
-    });
-
     res.status(201).json({
       success: true,
-      message: `Registration successful! Your 5-digit PIN has been emailed to ${cleanEmail}. Check your inbox to log in.`,
+      message: `Registration successful! Your 5-digit PIN has been emailed to ${cleanEmail}. Please check your inbox and spam folder to log in.`,
       username: newUser.username,
       email: newUser.email,
     });
@@ -1505,8 +1520,42 @@ app.get("/api/users/me", authMiddleware, async (req: Request, res: Response) => 
 // HEALTH CHECK & ERROR HANDLERS
 // ═══════════════════════════════════════════════════════════════
 
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok" });
+});
+
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
+});
+
+// Admin endpoint to check email service configuration
+app.get("/api/admin/email-status", adminLimiter, async (_req: Request, res: Response) => {
+  res.json(getEmailServiceStatus());
+});
+
+// Admin endpoint to test email dispatch with live diagnostics
+app.post("/api/admin/test-email", adminLimiter, async (req: Request, res: Response) => {
+  try {
+    const { targetEmail } = req.body || {};
+    const testRecipient = targetEmail ? sanitize(targetEmail) : (process.env.ADMIN_EMAIL || process.env.SMTP_USER);
+    if (!testRecipient) {
+      return res.status(400).json({ error: "No target email specified" });
+    }
+    const testPin = "99999";
+    const sent = await sendWelcomeEmail(testRecipient, "AdminTestUser", testPin);
+    const status = getEmailServiceStatus();
+    res.json({
+      success: sent,
+      recipient: testRecipient,
+      provider: status.provider,
+      details: status.details,
+      message: sent
+        ? `Test email sent successfully to ${testRecipient}!`
+        : `Failed to dispatch test email to ${testRecipient}. Check server logs for details.`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to send test email" });
+  }
 });
 
 // 404 handler

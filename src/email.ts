@@ -1,10 +1,21 @@
+import dns from "dns";
 import nodemailer, { Transporter } from "nodemailer";
 import dotenv from "dotenv";
 import path from "path";
 import fs from "fs";
 
+// Force Node.js to resolve IPv4 addresses before IPv6 (prevents unroutable IPv6 ENETUNREACH in Docker/Railway containers)
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
 dotenv.config();
 
+// Brevo (Sendinblue) API — Native HTTPS fetch over Port 443 (Zero packages, unblocked on Railway, no domain needed)
+const BREVO_API_KEY = (process.env.BREVO_API_KEY || "").trim();
+const BREVO_FROM_EMAIL = (process.env.BREVO_FROM_EMAIL || process.env.BREVO_SENDER || process.env.SMTP_USER || "aimalkhann.dev@gmail.com").trim();
+
+// SMTP configuration (fallback for local dev or VPS)
 const SMTP_HOST = (process.env.SMTP_HOST || "smtp.gmail.com").trim();
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || "465", 10);
 const SMTP_USER = (process.env.SMTP_USER || "").trim();
@@ -16,7 +27,9 @@ const isSmtpConfigured = Boolean(SMTP_USER && SMTP_PASS && SMTP_USER !== "your-g
 
 let transporter: Transporter | null = null;
 
-if (isSmtpConfigured) {
+if (BREVO_API_KEY) {
+  console.log(`[Email Service] Configured live Brevo HTTPS API transport (Sender: ${BREVO_FROM_EMAIL})`);
+} else if (isSmtpConfigured) {
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
@@ -25,11 +38,18 @@ if (isSmtpConfigured) {
       user: SMTP_USER,
       pass: SMTP_PASS,
     },
-  });
-  console.log(`[Email Service] Configured live SMTP transport with user: ${SMTP_USER}`);
+    family: 4, // Force IPv4 to prevent unroutable IPv6 ENETUNREACH in Railway / Linux containers
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    tls: {
+      rejectUnauthorized: false,
+    },
+  } as any);
+  console.log(`[Email Service] Configured live Gmail SMTP transport with user: ${SMTP_USER} (${SMTP_HOST}:${SMTP_PORT}, IPv4 forced)`);
 } else {
   console.log(
-    `[Email Service] Live SMTP credentials not configured (SMTP_USER/SMTP_PASS in .env). Email service operating in mock console mode.`
+    `[Email Service] Live email credentials not configured (Set BREVO_API_KEY or SMTP_USER/SMTP_PASS). Email service operating in mock console mode.`
   );
 }
 
@@ -38,42 +58,176 @@ const logoPath = path.resolve(__dirname, "../../frontend/public/quizshield_logo.
 const hasLogo = fs.existsSync(logoPath);
 
 /**
- * Helper to dispatch an email via Nodemailer or fall back to rich console mock logging
+ * Sends email via Brevo HTTPS REST API (Port 443 — works seamlessly on Railway with any verified Gmail sender)
  */
-async function dispatchEmail(options: {
+async function sendViaBrevo(options: {
   to: string;
   subject: string;
   html: string;
   textFallback: string;
 }): Promise<boolean> {
-  if (transporter && isSmtpConfigured) {
-    try {
-      const info = await transporter.sendMail({
-        from: `"QuizShield Platform" <${SMTP_USER}>`,
-        to: options.to,
-        subject: options.subject,
-        html: options.html,
-        text: options.textFallback,
-        headers: {
-          "X-Entity-Ref-ID": `${Date.now()}`,
+  try {
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        sender: {
+          name: "QuizShield Platform",
+          email: BREVO_FROM_EMAIL,
         },
-      });
-      console.log(`[Email Service] Email sent successfully to ${options.to}. MessageId: ${info.messageId}`);
-      return true;
-    } catch (err: any) {
-      console.error(`[Email Service Error] Failed to send email to ${options.to}:`, err.message);
+        to: [{ email: options.to }],
+        subject: options.subject,
+        htmlContent: options.html,
+        textContent: options.textFallback,
+      }),
+    });
+
+    const data: any = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(
+        `[Email Service Error] Brevo API failed (${res.status}):`,
+        data?.message || JSON.stringify(data)
+      );
+      if (data?.message?.includes("unrecognised IP")) {
+        console.error(
+          `[Email Service Action Required] Brevo blocked this IP address. Please go to https://app.brevo.com/security/authorised_ips and disable IP restrictions.`
+        );
+      }
       return false;
     }
-  } else {
-    // Mock logger for seamless local testing & demonstration
-    console.log("\n=======================================================");
-    console.log(`📨 [MOCK EMAIL DISPATCH] To: ${options.to}`);
-    console.log(`📌 Subject: ${options.subject}`);
-    console.log("-------------------------------------------------------");
-    console.log(options.textFallback);
-    console.log("=======================================================\n");
+
+    console.log(`[Email Service] Email sent successfully via Brevo to ${options.to}. MessageId: ${data.messageId}`);
     return true;
+  } catch (err: any) {
+    console.error(`[Email Service Error] Failed to dispatch via Brevo to ${options.to}:`, err.message);
+    return false;
   }
+}
+
+/**
+ * Direct HTTPS POST request to Brevo API over port 443 (Zero external libraries)
+ */
+export const sendPinEmail = async (email: string, pin: string): Promise<boolean> => {
+  const apiKey = (process.env.BREVO_API_KEY || "").trim();
+  const senderEmail = (process.env.BREVO_FROM_EMAIL || process.env.BREVO_SENDER || process.env.SMTP_USER || "aimalkhann.dev@gmail.com").trim();
+
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "accept": "application/json",
+      "api-key": apiKey,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      sender: { name: "QuizShield Platform", email: senderEmail },
+      to: [{ email: email }],
+      subject: "Your QuizShield Login PIN",
+      htmlContent: `<h2>Welcome to QuizShield</h2><p>Your 5-Digit PIN is: <b>${pin}</b></p>`,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData: any = await response.json().catch(() => ({}));
+    console.error(`[Email Service Error] Brevo API error:`, errorData);
+    throw new Error(`Brevo API Error: ${response.statusText} - ${errorData?.message || ""}`);
+  }
+
+  return true;
+};
+
+
+/**
+ * Sends email via traditional SMTP with IPv4 and fail-fast timeouts
+ */
+async function sendViaSmtp(options: {
+  to: string;
+  subject: string;
+  html: string;
+  textFallback: string;
+}): Promise<boolean> {
+  if (!transporter) return false;
+  try {
+    const info = await transporter.sendMail({
+      from: `"QuizShield Platform" <${SMTP_USER}>`,
+      to: options.to,
+      subject: options.subject,
+      html: options.html,
+      text: options.textFallback,
+      headers: {
+        "X-Entity-Ref-ID": `${Date.now()}`,
+      },
+    });
+    console.log(`[Email Service] Email sent successfully via SMTP to ${options.to}. MessageId: ${info.messageId}`);
+    return true;
+  } catch (err: any) {
+    console.error(`[Email Service Error] Failed to send email to ${options.to}:`, err.message);
+    if (err.message?.includes("timeout") || err.message?.includes("ENETUNREACH") || err.code === "ETIMEDOUT") {
+      console.error(
+        `[Email Service Diagnostic] Cloud hosts like Railway block outbound SMTP ports (465/587) on standard tiers. Set RESEND_API_KEY in your Railway Variables to send emails via HTTPS port 443 without port blocking.`
+      );
+    }
+    return false;
+  }
+}
+
+/**
+ * Helper to dispatch an email via Resend, Brevo, Nodemailer SMTP, or fall back to console mock logging
+ */
+export async function dispatchEmail(options: {
+  to: string;
+  subject: string;
+  html: string;
+  textFallback: string;
+}): Promise<boolean> {
+  if (BREVO_API_KEY) {
+    return sendViaBrevo(options);
+  }
+  if (transporter && isSmtpConfigured) {
+    return sendViaSmtp(options);
+  }
+
+  // Mock logger for seamless local testing & demonstration
+  console.log("\n=======================================================");
+  console.log(`📨 [MOCK EMAIL DISPATCH] To: ${options.to}`);
+  console.log(`📌 Subject: ${options.subject}`);
+  console.log("-------------------------------------------------------");
+  console.log(options.textFallback);
+  console.log("=======================================================\n");
+  return true;
+}
+
+export function getEmailServiceStatus(): {
+  provider: "brevo" | "smtp" | "mock";
+  configured: boolean;
+  sender: string;
+  details: string;
+} {
+  if (BREVO_API_KEY) {
+    return {
+      provider: "brevo",
+      configured: true,
+      sender: BREVO_FROM_EMAIL,
+      details: "Using Brevo HTTPS REST API (Port 443 — verified Gmail sender, unblocked on Railway)",
+    };
+  }
+  if (isSmtpConfigured) {
+    return {
+      provider: "smtp",
+      configured: true,
+      sender: SMTP_USER,
+      details: `Using Gmail SMTP (${SMTP_HOST}:${SMTP_PORT}, family: 4 forced IPv4).`,
+    };
+  }
+  return {
+    provider: "mock",
+    configured: false,
+    sender: "console-logger",
+    details: "No live provider configured. Emails printed to console.",
+  };
 }
 
 /**
